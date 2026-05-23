@@ -52,15 +52,7 @@ function createTestConfig(databasePath: string): LcmConfig {
     summaryTimeoutMs: 60_000,
     timezone: "UTC",
     pruneHeartbeatOk: false,
-    transcriptGcEnabled: false,
     proactiveThresholdCompactionMode: "deferred",
-    autoRotateSessionFiles: {
-      enabled: true,
-      createBackups: false,
-      sizeBytes: 2 * 1024 * 1024,
-      startup: "rotate",
-      runtime: "rotate",
-    },
     summaryMaxOverageFactor: 3,
     customInstructions: "",
     circuitBreakerThreshold: 5,
@@ -2531,7 +2523,6 @@ describe("LcmContextEngine.ingest content extraction", () => {
     await withTempHome(async () => {
       const engine = createEngineWithConfig({
         largeFileTokenThreshold: 20,
-        transcriptGcEnabled: true,
       });
       const sessionId = randomUUID();
       const sessionFile = createSessionFilePath("transcript-gc-maintain");
@@ -2705,7 +2696,6 @@ describe("LcmContextEngine.ingest content extraction", () => {
   it("maintain() skips transcript GC when transcriptGcEnabled is false", async () => {
     await withTempHome(async () => {
       const engine = createEngineWithConfig({
-        transcriptGcEnabled: false,
       });
       const sessionId = randomUUID();
       const sessionFile = createSessionFilePath("transcript-gc-disabled");
@@ -2739,7 +2729,6 @@ describe("LcmContextEngine.ingest content extraction", () => {
 
   it("maintain() consumes deferred compaction without requiring a transcript path", async () => {
     const engine = createEngineWithConfig({
-      transcriptGcEnabled: true,
     });
     const sessionId = "maintain-sqlite-no-path";
     const rewriteTranscriptEntries = vi.fn();
@@ -3944,13 +3933,6 @@ describe("LcmContextEngine.bootstrap", () => {
       {
         databasePath,
         freshTailCount: 1,
-        autoRotateSessionFiles: {
-          enabled: true,
-          createBackups: false,
-          sizeBytes: 1_500,
-          startup: "off",
-          runtime: "rotate",
-        },
       },
       { log },
     );
@@ -4000,13 +3982,6 @@ describe("LcmContextEngine.bootstrap", () => {
     };
     const engine = createEngineWithDeps(
       {
-        autoRotateSessionFiles: {
-          enabled: true,
-          createBackups: false,
-          sizeBytes: beforeSize + 1_000,
-          startup: "off",
-          runtime: "rotate",
-        },
       },
       { log },
     );
@@ -4046,13 +4021,6 @@ describe("LcmContextEngine.bootstrap", () => {
       {
         ignoreSessionPatterns: ["agent:*:cron:**"],
         statelessSessionPatterns: ["agent:*:subagent:**"],
-        autoRotateSessionFiles: {
-          enabled: true,
-          createBackups: false,
-          sizeBytes: 500,
-          startup: "off",
-          runtime: "rotate",
-        },
       },
       { log },
     );
@@ -4109,13 +4077,6 @@ describe("LcmContextEngine.bootstrap", () => {
     const engine = createEngineWithDeps(
       {
         freshTailCount: 1,
-        autoRotateSessionFiles: {
-          enabled: true,
-          createBackups: false,
-          sizeBytes: 1_500,
-          startup: "rotate",
-          runtime: "off",
-        },
       },
       { log, listStartupSessionFileCandidates },
     );
@@ -4158,13 +4119,6 @@ describe("LcmContextEngine.bootstrap", () => {
     const engine = createEngineWithDeps(
       {
         freshTailCount: 1,
-        autoRotateSessionFiles: {
-          enabled: true,
-          createBackups: false,
-          sizeBytes: 1_500,
-          startup: "rotate",
-          runtime: "off",
-        },
       },
       {
         log,
@@ -4228,13 +4182,6 @@ describe("LcmContextEngine.bootstrap", () => {
     const engine = createEngineWithDeps(
       {
         freshTailCount: 1,
-        autoRotateSessionFiles: {
-          enabled: true,
-          createBackups: false,
-          sizeBytes: belowThresholdBytes,
-          startup: "rotate",
-          runtime: "off",
-        },
       },
       {
         log,
@@ -4315,13 +4262,6 @@ describe("LcmContextEngine.bootstrap", () => {
     const engine = createEngineWithDeps(
       {
         freshTailCount: 1,
-        autoRotateSessionFiles: {
-          enabled: true,
-          createBackups: true,
-          sizeBytes: 1_500,
-          startup: "rotate",
-          runtime: "off",
-        },
       },
       {
         log,
@@ -4397,13 +4337,6 @@ describe("LcmContextEngine.bootstrap", () => {
     const engine = createEngineWithDeps(
       {
         freshTailCount: 1,
-        autoRotateSessionFiles: {
-          enabled: true,
-          createBackups: false,
-          sizeBytes: 1_500,
-          startup: "off",
-          runtime: "rotate",
-        },
       },
       { log },
     );
