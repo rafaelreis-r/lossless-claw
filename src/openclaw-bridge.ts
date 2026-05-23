@@ -94,14 +94,7 @@ export type AgentMessage = {
   isError?: boolean;
 };
 
-export type ContextEngineTranscriptScope = {
-  agentId: string;
-  path?: string;
-  sessionId: string;
-};
-
 export type ContextEngineRuntimeContext = Record<string, unknown> & {
-  transcriptScope?: ContextEngineTranscriptScope;
   llm?: {
     complete: (...args: any[]) => Promise<any>;
   };
@@ -113,8 +106,6 @@ export type ContextEngine = {
   bootstrap(params: {
     sessionId: string;
     sessionKey?: string;
-    sessionFile?: string;
-    transcriptScope?: ContextEngineTranscriptScope;
     messages?: AgentMessage[];
   }): Promise<BootstrapResult>;
   ingest(params: {
@@ -138,8 +129,6 @@ export type ContextEngine = {
   afterTurn?(params: {
     sessionId: string;
     sessionKey?: string;
-    sessionFile?: string;
-    transcriptScope?: ContextEngineTranscriptScope;
     messages: AgentMessage[];
     prePromptMessageCount: number;
     autoCompactionSummary?: string;
@@ -151,8 +140,6 @@ export type ContextEngine = {
   maintain?(params: {
     sessionId: string;
     sessionKey?: string;
-    sessionFile?: string;
-    transcriptScope?: ContextEngineTranscriptScope;
     runtimeContext?: ContextEngineRuntimeContext;
   }): Promise<{
     changed: boolean;
@@ -163,8 +150,6 @@ export type ContextEngine = {
   compact(params: {
     sessionId: string;
     sessionKey?: string;
-    sessionFile?: string;
-    transcriptScope?: ContextEngineTranscriptScope;
     tokenBudget?: number;
     currentTokenCount?: number;
     compactionTarget?: "budget" | "threshold";
