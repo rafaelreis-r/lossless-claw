@@ -1506,6 +1506,11 @@ const PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT = PROMPT_RECALL_SEARCH_LIMIT * 4;
 const DELIVERY_ONLY_TRANSCRIPT_MAX_MESSAGES = 4;
 const INJECTED_DELIVERY_TRANSCRIPT_PATTERN = /\b(?:delivery[-_\s]?mirror|config[-_\s]?audit)\b/i;
 const INJECTED_METADATA_PREAMBLE_PREFIX = "Conversation info (untrusted metadata)";
+// Upper bound on the persisted-frontier scan used to decide placeholder-checkpoint
+// recovery eligibility (#822). A genuinely stuck placeholder frontier is a handful
+// of injected-metadata rows; a frontier larger than this conservatively freezes
+// rather than scan an arbitrarily large real DB tail (#649 no-proof-no-advance).
+const NON_ANCHORING_FRONTIER_SCAN_LIMIT = 32;
 const OPENCLAW_RUNTIME_CONTEXT_SENTINEL =
   "OpenClaw runtime context for the immediately preceding user message. This context is runtime-generated, not user-author.";
 const PROMPT_RECALL_SENSITIVE_IDENTIFIER_PATTERN =
@@ -6245,6 +6250,35 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   /**
+   * Decide whether a placeholder-checkpoint conversation may recover by importing
+   * its on-disk transcript as a new epoch (#822). Safe ONLY when the persisted
+   * frontier holds no real conversation content that a rotated/unrelated transcript
+   * could overwrite. Generalizes #837's single-injected-metadata-preamble check to
+   * any frontier composed entirely of non-anchoring injected-metadata rows; an
+   * empty frontier is trivially safe, and a larger or non-metadata frontier
+   * conservatively returns false so the conversation freezes (#649) rather than
+   * risk contaminating real history (the failure that closed #824).
+   */
+  private async conversationFrontierIsEntirelyNonAnchoring(
+    conversationId: number,
+  ): Promise<boolean> {
+    const existingMessageCount = await this.conversationStore.getMessageCount(conversationId);
+    if (existingMessageCount === 0) {
+      return true;
+    }
+    if (existingMessageCount > NON_ANCHORING_FRONTIER_SCAN_LIMIT) {
+      return false;
+    }
+    const frontier = await this.conversationStore.getMessages(conversationId, {
+      limit: NON_ANCHORING_FRONTIER_SCAN_LIMIT,
+    });
+    return (
+      frontier.length === existingMessageCount &&
+      frontier.every((message) => isLikelyInjectedMetadataPreambleRecord(message))
+    );
+  }
+
+  /**
    * Reconcile session-file history with persisted messages and append only the
    * tail that is present in JSONL but missing from LCM.
    */
@@ -6256,6 +6290,10 @@ export class LcmContextEngine implements ContextEngine {
     checkpointEntryHash?: string | null;
     skipContentAnchorScan?: boolean;
     allowNoAnchorImport?: boolean;
+    // Lift the no-anchor import cap because the persisted frontier was proven to
+    // hold no real conversation content (#822). Bounded by the transcript length,
+    // never unbounded — set ONLY together with a proven non-anchoring frontier.
+    allowFullNonAnchoringFrontierImport?: boolean;
     noAnchorImportReason?: string;
   }): Promise<TranscriptReconcileResult> {
     const { sessionId, conversationId, historicalMessages } = params;
@@ -6375,7 +6413,8 @@ export class LcmContextEngine implements ContextEngine {
         if (params.allowNoAnchorImport) {
           if (
             (params.noAnchorImportReason === "path-mismatch" ||
-              params.noAnchorImportReason === "checkpoint-missing-recovery") &&
+              params.noAnchorImportReason === "checkpoint-missing-recovery" ||
+              params.noAnchorImportReason === "placeholder-checkpoint-recovery") &&
             isLikelyInjectedDeliveryOnlyTranscript(historicalMessages)
           ) {
             this.deps.log.warn(
@@ -6427,7 +6466,7 @@ export class LcmContextEngine implements ContextEngine {
           }
 
           const importCap = Math.max(Math.floor(existingDbCount * 0.2), 50);
-          if (noAnchorImportMessages.length > importCap) {
+          if (!params.allowFullNonAnchoringFrontierImport && noAnchorImportMessages.length > importCap) {
             this.deps.log.warn(
               `[lcm] reconcileSessionTail: no anchor import cap exceeded for ${sessionContext} - would import ${noAnchorImportMessages.length} messages (existing: ${existingDbCount}, cap: ${importCap}, reason: ${params.noAnchorImportReason ?? "unspecified"}). Aborting to prevent flood.`,
             );
@@ -7186,11 +7225,26 @@ export class LcmContextEngine implements ContextEngine {
               return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
             }
             if (placeholderCheckpoint && appended.messages.length > 0) {
+              // #822: a placeholder checkpoint means this conversation was never
+              // ingested, so its on-disk transcript is the source of truth and
+              // importing it as a new epoch is the correct recovery — but ONLY when
+              // the persisted frontier holds no real conversation content a
+              // rotated/unrelated transcript could overwrite. When eligible we also
+              // lift the no-anchor import cap because there is no real content to
+              // flood/duplicate (bounded by the transcript, never unbounded — the
+              // failure that closed #824). Otherwise allowNoAnchorImport stays false
+              // and the conversation freezes exactly as before (#649).
+              const placeholderFrontierIsNonAnchoring =
+                await this.conversationFrontierIsEntirelyNonAnchoring(
+                  conversation.conversationId,
+                );
               const reconcile = await this.reconcileSessionTail({
                 sessionId: params.sessionId,
                 sessionKey: params.sessionKey,
                 conversationId: conversation.conversationId,
                 historicalMessages: appended.messages,
+                allowNoAnchorImport: placeholderFrontierIsNonAnchoring,
+                allowFullNonAnchoringFrontierImport: placeholderFrontierIsNonAnchoring,
                 noAnchorImportReason: "placeholder-checkpoint-recovery",
               });
               if (reconcile.importedMessages > 0) {
@@ -7447,14 +7501,16 @@ export class LcmContextEngine implements ContextEngine {
         }
         // #837: a conversation with bootstrapped_at SET but no bootstrap_state
         // row reaches reason="checkpoint-missing" with a non-anchoring frontier
-        // (e.g. a single injected metadata preamble). Without a no-anchor import
-        // it imports 0 messages and never persists a checkpoint, so afterTurn
+        // (e.g. injected metadata preambles). Without a no-anchor import it
+        // imports 0 messages and never persists a checkpoint, so afterTurn
         // loops the "did not cover the transcript frontier" warning forever and
         // compaction never runs. The rotate lane already recovers via
         // allowNoAnchorImportOnCheckpointMissing; mirror that on the afterTurn
-        // lane, but ONLY for the observed injected-metadata frontier. A real
-        // historical DB tail with a divergent rewritten transcript must still
-        // freeze per #649's no-proof-no-advance guard, so do not treat
+        // lane, but ONLY for a frontier composed entirely of injected-metadata
+        // rows (#822 generalizes #837's single-row check: hosts inject one
+        // metadata preamble per delivery, so stuck frontiers can hold several).
+        // A real historical DB tail with a divergent rewritten transcript must
+        // still freeze per #649's no-proof-no-advance guard, so do not treat
         // bootstrapped_at alone as lineage proof. The downstream no-anchor
         // import path is itself guarded (replay-overlap detection, import cap,
         // delivery-only block).
@@ -7464,14 +7520,10 @@ export class LcmContextEngine implements ContextEngine {
           conversation.sessionId === params.sessionId &&
           conversation.bootstrappedAt !== null
         ) {
-          const [existingMessageCount, latestPersistedMessage] = await Promise.all([
-            this.conversationStore.getMessageCount(conversation.conversationId),
-            this.conversationStore.getLastMessage(conversation.conversationId),
-          ]);
           checkpointMissingMetadataFrontier =
-            existingMessageCount === 1 &&
-            latestPersistedMessage !== null &&
-            isLikelyInjectedMetadataPreambleRecord(latestPersistedMessage);
+            await this.conversationFrontierIsEntirelyNonAnchoring(
+              conversation.conversationId,
+            );
         }
         const recoverCheckpointMissingNoAnchor =
           reason === "checkpoint-missing" &&
@@ -7487,6 +7539,13 @@ export class LcmContextEngine implements ContextEngine {
             reason === "path-mismatch" ||
             reason === "same-path-shrink" ||
             recoverCheckpointMissingNoAnchor,
+          // #822: when the checkpoint-missing frontier is a proven non-anchoring
+          // metadata frontier, lift the no-anchor import cap too. Otherwise a large
+          // real transcript (hundreds of messages) is blocked by the cap, stays
+          // unimported, and the host keeps sending it raw until the provider context
+          // window overflows. Same safety property as the placeholder lane; gated on
+          // the proven metadata frontier, never the caller-asserted rotate flag.
+          allowFullNonAnchoringFrontierImport: checkpointMissingMetadataFrontier,
           noAnchorImportReason: recoverCheckpointMissingNoAnchor
             ? params.allowNoAnchorImportOnCheckpointMissing === true
               ? "rotate-checkpoint-missing"
