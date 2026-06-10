@@ -1511,6 +1511,12 @@ const INJECTED_METADATA_PREAMBLE_PREFIX = "Conversation info (untrusted metadata
 // of injected-metadata rows; a frontier larger than this conservatively freezes
 // rather than scan an arbitrarily large real DB tail (#649 no-proof-no-advance).
 const NON_ANCHORING_FRONTIER_SCAN_LIMIT = 32;
+// Minimum number of never-imported transcript messages required before the
+// coverage-gap backfill runs. Gaps at or below the no-anchor import cap floor
+// are reachable through the ordinary anchored tail-append path; the backfill
+// exists for the pathological shape where hundreds of historical messages were
+// skipped while the persisted tail still matches the transcript tail.
+const COVERAGE_GAP_BACKFILL_MIN_DEFICIT = 50;
 const OPENCLAW_RUNTIME_CONTEXT_SENTINEL =
   "OpenClaw runtime context for the immediately preceding user message. This context is runtime-generated, not user-author.";
 const PROMPT_RECALL_SENSITIVE_IDENTIFIER_PATTERN =
@@ -6279,6 +6285,91 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   /**
+   * Backfill transcript history that was never imported even though the
+   * persisted DB tail matches the transcript tail ("coverage gap"). Live-turn
+   * ingestion persists recent turns directly, so a conversation that lost its
+   * checkpoint (and never imported its history) still ends each turn with a DB
+   * tail equal to the file tail — the tail comparison then reports in-sync,
+   * the checkpoint refreshes to EOF, and the missing middle becomes permanently
+   * unreachable via append-only reads. Callers prove lineage (session match,
+   * bootstrapped conversation, checkpoint-missing/placeholder lane); this
+   * method additionally requires zero summaries (a summarized conversation has
+   * legitimate sparse-coverage states) and a material deficit (persisted rows
+   * cover less than half of the transcript, missing more than the no-anchor
+   * cap floor) so healthy conversations keep flowing through the ordinary
+   * anchored tail-append path. The import is identity-occurrence aware: for
+   * each message identity the first `persistedCount` occurrences are treated
+   * as already covered, so existing rows are never duplicated. Backfilled rows
+   * append after the existing frontier (seq order inside the gap range is
+   * degraded; content is preserved).
+   */
+  private async backfillTranscriptCoverageGap(params: {
+    sessionId: string;
+    sessionKey?: string;
+    conversationId: number;
+    historicalMessages: AgentMessage[];
+    lane: string;
+  }): Promise<number> {
+    const { conversationId, historicalMessages } = params;
+    const sessionContext = this.formatSessionLogContext({
+      conversationId,
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+    });
+    const candidateMessages = this.filterSyntheticHeartbeatTranscriptMessages({
+      messages: historicalMessages,
+      sessionContext,
+      source: "coverage-gap backfill",
+    });
+    const existingDbCount = await this.conversationStore.getMessageCount(conversationId);
+    const missingCount = candidateMessages.length - existingDbCount;
+    if (
+      existingDbCount * 2 >= candidateMessages.length ||
+      missingCount <= COVERAGE_GAP_BACKFILL_MIN_DEFICIT
+    ) {
+      return 0;
+    }
+    const summaries = await this.summaryStore.getSummariesByConversation(conversationId);
+    if (summaries.length > 0) {
+      return 0;
+    }
+    const persistedIdentityCounts = new Map<string, number>();
+    const persistedOccurrencesSkipped = new Map<string, number>();
+    let importedMessages = 0;
+    for (const message of candidateMessages) {
+      const stored = toStoredMessage(message);
+      const identity = messageIdentity(stored.role, stored.content);
+      let persistedCount = persistedIdentityCounts.get(identity);
+      if (persistedCount === undefined) {
+        persistedCount = await this.conversationStore.countMessagesByIdentity(
+          conversationId,
+          stored.role,
+          stored.content,
+        );
+        persistedIdentityCounts.set(identity, persistedCount);
+      }
+      const skipped = persistedOccurrencesSkipped.get(identity) ?? 0;
+      if (skipped < persistedCount) {
+        persistedOccurrencesSkipped.set(identity, skipped + 1);
+        continue;
+      }
+      const result = await this.ingestSingle({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        message,
+        skipReplayTimestampFloodGuard: true,
+      });
+      if (result.ingested) {
+        importedMessages += 1;
+      }
+    }
+    this.deps.log.warn(
+      `[lcm] reconcileSessionTail: coverage-gap backfill imported ${importedMessages}/${candidateMessages.length} historical messages for ${sessionContext} (existing: ${existingDbCount}, lane: ${params.lane}) — transcript tail matched but persisted coverage was materially deficient`,
+    );
+    return importedMessages;
+  }
+
+  /**
    * Reconcile session-file history with persisted messages and append only the
    * tail that is present in JSONL but missing from LCM.
    */
@@ -7247,10 +7338,33 @@ export class LcmContextEngine implements ContextEngine {
                 allowFullNonAnchoringFrontierImport: placeholderFrontierIsNonAnchoring,
                 noAnchorImportReason: "placeholder-checkpoint-recovery",
               });
-              if (reconcile.importedMessages > 0) {
+              // Mirror the checkpoint-missing lane: a tail-only overlap with a
+              // placeholder checkpoint can hide a never-imported middle (live
+              // turns persisted the recent tail while the history import never
+              // ran). Backfill the gap before the in-sync result lets the
+              // checkpoint advance to EOF.
+              let placeholderCoverageGapImported = 0;
+              if (
+                reconcile.hasOverlap &&
+                reconcile.importedMessages === 0 &&
+                !reconcile.blockedByImportCap &&
+                conversation.sessionId === params.sessionId &&
+                conversation.bootstrappedAt !== null
+              ) {
+                placeholderCoverageGapImported = await this.backfillTranscriptCoverageGap({
+                  sessionId: params.sessionId,
+                  sessionKey: params.sessionKey,
+                  conversationId: conversation.conversationId,
+                  historicalMessages: appended.messages,
+                  lane: "placeholder-checkpoint-recovery",
+                });
+              }
+              const placeholderImported =
+                reconcile.importedMessages + placeholderCoverageGapImported;
+              if (placeholderImported > 0) {
                 this.recordRecentBootstrapImport(
                   conversation.conversationId,
-                  reconcile.importedMessages,
+                  placeholderImported,
                   "reconciled missing session messages",
                 );
                 await this.refreshBootstrapState({
@@ -7258,7 +7372,10 @@ export class LcmContextEngine implements ContextEngine {
                   sessionFile: params.sessionFile,
                 });
               }
-              return reconcile;
+              return {
+                ...reconcile,
+                importedMessages: placeholderImported,
+              };
             }
 
             const appendOnlySessionContext = this.formatSessionLogContext({
@@ -7555,14 +7672,39 @@ export class LcmContextEngine implements ContextEngine {
         if (reconcile.blockedByImportCap) {
           return { importedMessages: 0, blockedByImportCap: true, hasOverlap: reconcile.hasOverlap };
         }
-        if (reconcile.importedMessages > 0) {
+        // A tail-only overlap is necessary but not sufficient evidence that the
+        // transcript was reconciled: live-turn ingestion can persist a recent
+        // tail into a conversation whose checkpoint (and historical import) was
+        // lost, so the DB tail matches the file tail while hundreds of middle
+        // messages were never imported. Without this check the in-sync result
+        // below refreshes the checkpoint to EOF and the gap becomes permanently
+        // unreachable (append-only reads thereafter). Backfill the gap before
+        // refreshing, under the same lineage gates as the recovery above.
+        let coverageGapImported = 0;
+        if (
+          reconcile.hasOverlap &&
+          reconcile.importedMessages === 0 &&
+          reason === "checkpoint-missing" &&
+          conversation.sessionId === params.sessionId &&
+          conversation.bootstrappedAt !== null
+        ) {
+          coverageGapImported = await this.backfillTranscriptCoverageGap({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            conversationId: conversation.conversationId,
+            historicalMessages,
+            lane: reason,
+          });
+        }
+        const slowPathImported = reconcile.importedMessages + coverageGapImported;
+        if (slowPathImported > 0) {
           this.recordRecentBootstrapImport(
             conversation.conversationId,
-            reconcile.importedMessages,
+            slowPathImported,
             "reconciled missing session messages",
           );
         }
-        if (!reconcile.hasOverlap && reconcile.importedMessages === 0) {
+        if (!reconcile.hasOverlap && slowPathImported === 0) {
           this.deps.log.warn(
             `[lcm] afterTurn: transcript reconcile found no anchor and imported 0 messages; skipping checkpoint refresh conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile} historicalMessages=${historicalMessages.length}`,
           );
@@ -7577,10 +7719,10 @@ export class LcmContextEngine implements ContextEngine {
         });
         rememberSlowReadState();
         this.deps.log.warn(
-          `[lcm] afterTurn: transcript reconcile slow path (full re-read) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile} historicalMessages=${historicalMessages.length} importedMessages=${reconcile.importedMessages} duration=${formatDurationMs(Date.now() - slowPathStartedAt)}`,
+          `[lcm] afterTurn: transcript reconcile slow path (full re-read) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile} historicalMessages=${historicalMessages.length} importedMessages=${slowPathImported} duration=${formatDurationMs(Date.now() - slowPathStartedAt)}`,
         );
         return {
-          importedMessages: reconcile.importedMessages,
+          importedMessages: slowPathImported,
           blockedByImportCap: false,
           hasOverlap: reconcile.hasOverlap,
         };
