@@ -6385,6 +6385,11 @@ export class LcmContextEngine implements ContextEngine {
     // hold no real conversation content (#822). Bounded by the transcript length,
     // never unbounded — set ONLY together with a proven non-anchoring frontier.
     allowFullNonAnchoringFrontierImport?: boolean;
+    // When an anchored import exceeds the flood cap, import a cap-bounded
+    // contiguous prefix of the missing tail instead of permanently blocking, so
+    // repeated turns converge instead of wedging. Set only by live afterTurn
+    // reconciles whose runtime session matches the conversation.
+    allowBoundedAnchoredCatchUp?: boolean;
     noAnchorImportReason?: string;
   }): Promise<TranscriptReconcileResult> {
     const { sessionId, conversationId, historicalMessages } = params;
@@ -6637,6 +6642,41 @@ export class LcmContextEngine implements ContextEngine {
     });
 
     if (existingDbCount > 0 && missingTail.length > Math.max(existingDbCount * 0.2, 50)) {
+      if (params.allowBoundedAnchoredCatchUp) {
+        // The anchor proves this transcript belongs to the conversation, so a
+        // permanent all-or-nothing block wedges it: every turn re-reads the
+        // file, exceeds the cap, imports nothing, and live persistence stays
+        // skipped (the "did not cover the transcript frontier" loop). Import a
+        // cap-bounded contiguous prefix of the missing tail instead — order is
+        // preserved because the slice directly follows the anchor — and keep
+        // blockedByImportCap=true so the checkpoint does not advance past the
+        // unimported remainder; subsequent turns anchor on the new frontier and
+        // converge. Per-turn volume stays within the flood cap.
+        const catchUpCap = Math.max(Math.floor(existingDbCount * 0.2), 50);
+        const catchUpSlice = missingTail.slice(0, catchUpCap);
+        let importedMessages = 0;
+        for (const [index, message] of catchUpSlice.entries()) {
+          const result = await this.ingestSingle({
+            sessionId,
+            sessionKey: params.sessionKey,
+            message,
+            skipReplayTimestampFloodGuard:
+              index < missingTailFiltered.replayGuardExemptPrefixLength,
+          });
+          if (result.ingested) {
+            importedMessages += 1;
+          }
+        }
+        this.deps.log.warn(
+          `[lcm] reconcileSessionTail: import cap exceeded for ${sessionContext} — imported leading ${importedMessages}/${missingTail.length} anchored tail messages and deferred the remainder to subsequent turns (existing: ${existingDbCount}, cap: ${catchUpCap}).`,
+        );
+        return {
+          blockedByImportCap: true,
+          blockedReason: "import-cap",
+          importedMessages,
+          hasOverlap: true,
+        };
+      }
       this.deps.log.warn(
         `[lcm] reconcileSessionTail: import cap exceeded for ${sessionContext} — would import ${missingTail.length} messages (existing: ${existingDbCount}). Aborting to prevent flood.`,
       );
@@ -7662,6 +7702,7 @@ export class LcmContextEngine implements ContextEngine {
           // window overflows. Same safety property as the placeholder lane; gated on
           // the proven metadata frontier, never the caller-asserted rotate flag.
           allowFullNonAnchoringFrontierImport: checkpointMissingMetadataFrontier,
+          allowBoundedAnchoredCatchUp: conversation.sessionId === params.sessionId,
           noAnchorImportReason: recoverCheckpointMissingNoAnchor
             ? params.allowNoAnchorImportOnCheckpointMissing === true
               ? "rotate-checkpoint-missing"
@@ -7669,7 +7710,11 @@ export class LcmContextEngine implements ContextEngine {
             : reason,
         });
         if (reconcile.blockedByImportCap) {
-          return { importedMessages: 0, blockedByImportCap: true, hasOverlap: reconcile.hasOverlap };
+          return {
+            importedMessages: reconcile.importedMessages,
+            blockedByImportCap: true,
+            hasOverlap: reconcile.hasOverlap,
+          };
         }
         // A tail-only overlap is necessary but not sufficient evidence that the
         // transcript was reconciled: live-turn ingestion can persist a recent
@@ -9341,6 +9386,16 @@ export class LcmContextEngine implements ContextEngine {
       this.deps.log.warn(
         `[lcm] afterTurn: transcript reconcile failed for ${sessionLabel}: ${describeLogError(err)}`,
       );
+      // Fail closed: without reconcile proof, the initialized in-sync default
+      // would persist this batch and refresh the checkpoint to EOF, advancing
+      // past transcript history that was never reconciled. Skipping persistence
+      // loses nothing — the transcript retains the turn and a later successful
+      // reconcile imports it.
+      transcriptReconcileResult = {
+        importedMessages: 0,
+        blockedByImportCap: false,
+        hasOverlap: false,
+      };
     }
     const transcriptReconcileUnsafeToAdvance =
       transcriptReconcileResult.blockedByImportCap ||

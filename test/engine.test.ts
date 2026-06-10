@@ -12749,6 +12749,123 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(checkpoint).not.toBeNull();
   });
 
+  it("afterTurn fails closed when the transcript reconcile throws: no batch persistence, no checkpoint advance", async () => {
+    // The catch handler used to leave the initialized in-sync default in place,
+    // so a thrown reconcile persisted the live batch AND refreshed the
+    // checkpoint to EOF — silently advancing past transcript history that was
+    // never reconciled.
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() } },
+    );
+    const sessionId = "reconcile-throw-fail-closed";
+    const sessionKey = "agent:main:reconcile-throw-fail-closed";
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: "seeded row before the failure" }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const sessionFile = createSessionFilePath("reconcile-throw-fail-closed");
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "seeded row before the failure" },
+    ]);
+    vi.spyOn(
+      engine as unknown as { reconcileTranscriptTailForAfterTurn: () => Promise<unknown> },
+      "reconcileTranscriptTailForAfterTurn",
+    ).mockRejectedValueOnce(new Error("synthetic reconcile failure"));
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "batch during the failure" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+    const contents = (
+      await engine.getConversationStore().getMessages(conversation!.conversationId)
+    ).map((m) => m.content);
+    expect(contents).not.toContain("batch during the failure");
+    expect(
+      await engine.getSummaryStore().getConversationBootstrapState(conversation!.conversationId),
+    ).toBeNull();
+    const warns = warnLog.mock.calls.map((c) => String(c[0]));
+    expect(warns.some((m) => m.includes("transcript reconcile failed"))).toBe(true);
+  });
+
+  it("converges an anchored import that exceeds the flood cap through bounded per-turn catch-up instead of wedging", async () => {
+    // An anchored reconcile whose missing tail exceeds the cap used to block
+    // permanently: every turn re-read the file, imported nothing, and skipped
+    // live persistence ("did not cover the transcript frontier" loop) — the
+    // partial-overlap cap loop reported on #822. The anchor proves lineage, so
+    // import a cap-bounded contiguous prefix per turn and converge.
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() } },
+    );
+    const sessionId = "anchored-cap-catch-up";
+    const sessionKey = "agent:main:anchored-cap-catch-up";
+    const transcript: Array<{ role: AgentMessage["role"]; content: string }> = Array.from(
+      { length: 200 },
+      (_, i) => ({
+        role: (i % 2 === 0 ? "user" : "assistant") as AgentMessage["role"],
+        content: `anchored turn ${i}`,
+      }),
+    );
+    for (const message of transcript.slice(0, 10)) {
+      await engine.ingest({ sessionId, sessionKey, message: makeMessage(message) });
+    }
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    await engine.getConversationStore().markConversationBootstrapped(conversation!.conversationId);
+    const sessionFile = createSessionFilePath("anchored-cap-catch-up");
+    writeLeafTranscript(sessionFile, transcript);
+
+    const messageCount = async (): Promise<number> =>
+      (await engine.getConversationStore().getMessages(conversation!.conversationId)).length;
+    const runTurn = async (): Promise<void> => {
+      await engine.afterTurn({
+        sessionId,
+        sessionKey,
+        sessionFile,
+        messages: [],
+        prePromptMessageCount: 0,
+        tokenBudget: 4_096,
+      });
+    };
+
+    await runTurn();
+    // First pass: 190 missing > cap(50) → bounded slice imported, checkpoint held back.
+    expect(await messageCount()).toBe(60);
+    expect(
+      await engine.getSummaryStore().getConversationBootstrapState(conversation!.conversationId),
+    ).toBeNull();
+    const warns = warnLog.mock.calls.map((c) => String(c[0]));
+    expect(warns.some((m) => m.includes("deferred the remainder to subsequent turns"))).toBe(true);
+
+    for (let i = 0; i < 6 && (await messageCount()) < 200; i++) {
+      await runTurn();
+    }
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages.length).toBe(200);
+    // Contiguous catch-up preserves transcript order.
+    expect(messages.map((m) => m.content)).toEqual(transcript.map((t) => t.content));
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint).not.toBeNull();
+    expect(checkpoint!.lastProcessedOffset).toBeGreaterThan(0);
+  });
+
   it("afterTurn recovers a checkpoint-missing conversation with a non-anchoring frontier instead of looping forever (#837)", async () => {
     // #837: a conversation with bootstrapped_at set but NO
     // conversation_bootstrap_state row classifies as reason="checkpoint-missing"
