@@ -7346,7 +7346,6 @@ export class LcmContextEngine implements ContextEngine {
               let placeholderCoverageGapImported = 0;
               if (
                 reconcile.hasOverlap &&
-                reconcile.importedMessages === 0 &&
                 !reconcile.blockedByImportCap &&
                 conversation.sessionId === params.sessionId &&
                 conversation.bootstrappedAt !== null
@@ -7678,12 +7677,15 @@ export class LcmContextEngine implements ContextEngine {
         // lost, so the DB tail matches the file tail while hundreds of middle
         // messages were never imported. Without this check the in-sync result
         // below refreshes the checkpoint to EOF and the gap becomes permanently
-        // unreachable (append-only reads thereafter). Backfill the gap before
-        // refreshing, under the same lineage gates as the recovery above.
+        // unreachable (append-only reads thereafter). A nonzero anchored import
+        // does not prove coverage either — the anchor can sit at the tip of a
+        // hole and import only the few trailing transcript entries — so it must
+        // not veto the check; the helper's deficit gate keeps covered
+        // conversations out. Backfill the gap before refreshing, under the same
+        // lineage gates as the recovery above.
         let coverageGapImported = 0;
         if (
           reconcile.hasOverlap &&
-          reconcile.importedMessages === 0 &&
           reason === "checkpoint-missing" &&
           conversation.sessionId === params.sessionId &&
           conversation.bootstrappedAt !== null
@@ -8449,11 +8451,35 @@ export class LcmContextEngine implements ContextEngine {
             await this.conversationStore.markConversationBootstrapped(conversationId);
           }
 
-          if (reconcile.importedMessages > 0) {
+          // This lane runs at session start, BEFORE any afterTurn reconcile,
+          // and persists the bootstrap checkpoint at EOF on any overlap — so a
+          // tail-anchored result here can seal a never-imported middle behind
+          // an append-only checkpoint before the afterTurn coverage check ever
+          // sees the conversation. Backfill under the same lineage gates as the
+          // afterTurn lane (the helper's deficit check keeps covered
+          // conversations out).
+          let bootstrapCoverageGapImported = 0;
+          if (
+            reconcile.hasOverlap &&
+            conversation.sessionId === params.sessionId &&
+            conversation.bootstrappedAt !== null
+          ) {
+            bootstrapCoverageGapImported = await this.backfillTranscriptCoverageGap({
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              conversationId,
+              historicalMessages,
+              lane: "bootstrap",
+            });
+          }
+
+          const bootstrapLaneImported =
+            reconcile.importedMessages + bootstrapCoverageGapImported;
+          if (bootstrapLaneImported > 0) {
             await persistBootstrapState(conversationId);
             return {
               bootstrapped: true,
-              importedMessages: reconcile.importedMessages,
+              importedMessages: bootstrapLaneImported,
               reason: "reconciled missing session messages",
             };
           }

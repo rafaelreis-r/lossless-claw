@@ -12591,8 +12591,11 @@ describe("LcmContextEngine fidelity and token budget", () => {
         content: `coverage turn ${i}`,
       }),
     );
-    // Persisted frontier: one injected metadata row plus the live-ingested tail
-    // (the last two transcript messages) — the production non-contiguous shape.
+    // Persisted frontier: one injected metadata row plus a live-ingested tail
+    // that stops two entries short of the transcript tip — the production
+    // shape: the anchor sits at the tip of the hole, the anchored reconcile
+    // imports the couple of trailing entries (importedMessages > 0), and that
+    // nonzero import must not veto the coverage backfill.
     await engine.ingest({
       sessionId,
       sessionKey,
@@ -12601,7 +12604,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
         content: "Conversation info (untrusted metadata): injected preamble",
       }),
     });
-    for (const tail of transcript.slice(-2)) {
+    for (const tail of transcript.slice(-4, -2)) {
       await engine.ingest({ sessionId, sessionKey, message: makeMessage(tail) });
     }
     const conversation = await engine.getConversationStore().getConversationForSession({
@@ -12625,10 +12628,13 @@ describe("LcmContextEngine fidelity and token budget", () => {
     ).map((m) => m.content);
     expect(contents).toContain("coverage turn 0");
     expect(contents).toContain("coverage turn 64");
-    // 130 transcript messages + the metadata row, with the 2 pre-persisted tail
-    // rows deduplicated by identity-occurrence accounting (no duplicates).
+    expect(contents).toContain("coverage turn 129");
+    // 130 transcript messages + the metadata row: the anchored import covers
+    // the 2 trailing entries, the backfill covers the middle, and pre-persisted
+    // rows are deduplicated by identity-occurrence accounting (no duplicates).
     expect(contents.length).toBe(131);
     expect(contents.filter((c) => c === "coverage turn 129").length).toBe(1);
+    expect(contents.filter((c) => c === "coverage turn 126").length).toBe(1);
     const checkpoint = await engine
       .getSummaryStore()
       .getConversationBootstrapState(conversation!.conversationId);
@@ -12636,6 +12642,63 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(checkpoint!.lastProcessedOffset).toBeGreaterThan(0);
     const warns = warnLog.mock.calls.map((c) => String(c[0]));
     expect(warns.some((m) => m.includes("coverage-gap backfill"))).toBe(true);
+  });
+
+  it("backfills a coverage gap on the bootstrap lane before the checkpoint seals it at EOF", async () => {
+    // The bootstrap lane runs at session start, BEFORE any afterTurn
+    // reconcile, and persists the checkpoint at EOF on any overlap. With a
+    // tail-anchored non-contiguous DB that sealed the never-imported middle
+    // behind an append-only checkpoint and the afterTurn coverage check never
+    // ran (the live failure shape: the unstuck conversation re-sealed itself
+    // on the very first turn).
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() } },
+    );
+    const sessionId = "bootstrap-coverage-gap";
+    const sessionKey = "agent:main:bootstrap-coverage-gap";
+    const transcript: Array<{ role: AgentMessage["role"]; content: string }> = Array.from(
+      { length: 130 },
+      (_, i) => ({
+        role: (i % 2 === 0 ? "user" : "assistant") as AgentMessage["role"],
+        content: `bootlane turn ${i}`,
+      }),
+    );
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({
+        role: "user",
+        content: "Conversation info (untrusted metadata): injected preamble",
+      }),
+    });
+    for (const tail of transcript.slice(-6, -4)) {
+      await engine.ingest({ sessionId, sessionKey, message: makeMessage(tail) });
+    }
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    await engine.getConversationStore().markConversationBootstrapped(conversation!.conversationId);
+    const sessionFile = createSessionFilePath("bootstrap-coverage-gap");
+    writeLeafTranscript(sessionFile, transcript);
+    const result = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(result.importedMessages).toBeGreaterThan(100);
+    const contents = (
+      await engine.getConversationStore().getMessages(conversation!.conversationId)
+    ).map((m) => m.content);
+    expect(contents).toContain("bootlane turn 0");
+    expect(contents).toContain("bootlane turn 129");
+    expect(contents.length).toBe(131);
+    expect(contents.filter((c) => c === "bootlane turn 124").length).toBe(1);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint).not.toBeNull();
+    const warns = warnLog.mock.calls.map((c) => String(c[0]));
+    expect(warns.some((m) => m.includes("coverage-gap backfill") && m.includes("lane: bootstrap"))).toBe(true);
   });
 
   it("does NOT backfill a checkpoint-missing conversation whose DB already covers the transcript", async () => {
