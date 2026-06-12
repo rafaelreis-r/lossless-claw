@@ -1771,6 +1771,185 @@ describe("LcmContextEngine afterTurn", () => {
     expect(contents.length).toBeGreaterThan(50);
   });
 
+  it("backfills a transcript coverage gap when the persisted tail matches the file tail but the middle was never imported", async () => {
+    // Live-turn ingestion persists recent turns directly into the DB, so a
+    // conversation that lost its checkpoint ends each turn with a DB tail equal
+    // to the transcript tail while hundreds of middle messages were never
+    // imported. The tail comparison then reports in-sync and the checkpoint
+    // refreshes to EOF, making the gap permanently unreachable (observed in
+    // production: 5 persisted rows vs a 644-message transcript).
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() } },
+    );
+    const sessionId = "coverage-gap-backfill";
+    const sessionKey = "agent:main:coverage-gap-backfill";
+    const transcript: Array<{ role: AgentMessage["role"]; content: string }> = Array.from(
+      { length: 130 },
+      (_, i) => ({
+        role: (i % 2 === 0 ? "user" : "assistant") as AgentMessage["role"],
+        content: `coverage turn ${i}`,
+      }),
+    );
+    // Persisted frontier: one injected metadata row plus a live-ingested tail
+    // that stops two entries short of the transcript tip — the production
+    // shape: the anchor sits at the tip of the hole, the anchored reconcile
+    // imports the couple of trailing entries (importedMessages > 0), and that
+    // nonzero import must not veto the coverage backfill.
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({
+        role: "user",
+        content: "Conversation info (untrusted metadata): injected preamble",
+      }),
+    });
+    for (const tail of transcript.slice(-4, -2)) {
+      await engine.ingest({ sessionId, sessionKey, message: makeMessage(tail) });
+    }
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    await engine.getConversationStore().markConversationBootstrapped(conversation!.conversationId);
+    const sessionFile = createSessionFilePath("coverage-gap-backfill");
+    writeLeafTranscript(sessionFile, transcript);
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+    const contents = (
+      await engine.getConversationStore().getMessages(conversation!.conversationId)
+    ).map((m) => m.content);
+    expect(contents).toContain("coverage turn 0");
+    expect(contents).toContain("coverage turn 64");
+    expect(contents).toContain("coverage turn 129");
+    // 130 transcript messages + the metadata row: the anchored import covers
+    // the 2 trailing entries, the backfill covers the middle, and pre-persisted
+    // rows are deduplicated by identity-occurrence accounting (no duplicates).
+    expect(contents.length).toBe(131);
+    expect(contents.filter((c) => c === "coverage turn 129").length).toBe(1);
+    expect(contents.filter((c) => c === "coverage turn 126").length).toBe(1);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint).not.toBeNull();
+    expect(checkpoint!.lastProcessedOffset).toBeGreaterThan(0);
+    const warns = warnLog.mock.calls.map((c) => String(c[0]));
+    expect(warns.some((m) => m.includes("coverage-gap backfill"))).toBe(true);
+  });
+
+  it("does NOT backfill a checkpoint-missing conversation whose DB already covers the transcript", async () => {
+    // The backfill must not disturb the common in-sync case: a conversation
+    // that merely lost its bootstrap_state row but holds the full history.
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() } },
+    );
+    const sessionId = "coverage-complete-no-backfill";
+    const sessionKey = "agent:main:coverage-complete-no-backfill";
+    const transcript: Array<{ role: AgentMessage["role"]; content: string }> = Array.from(
+      { length: 60 },
+      (_, i) => ({
+        role: (i % 2 === 0 ? "user" : "assistant") as AgentMessage["role"],
+        content: `complete turn ${i}`,
+      }),
+    );
+    for (const message of transcript) {
+      await engine.ingest({ sessionId, sessionKey, message: makeMessage(message) });
+    }
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    await engine.getConversationStore().markConversationBootstrapped(conversation!.conversationId);
+    const sessionFile = createSessionFilePath("coverage-complete-no-backfill");
+    writeLeafTranscript(sessionFile, transcript);
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+    const count = (
+      await engine.getConversationStore().getMessages(conversation!.conversationId)
+    ).length;
+    expect(count).toBe(60);
+    const warns = warnLog.mock.calls.map((c) => String(c[0]));
+    expect(warns.some((m) => m.includes("coverage-gap backfill"))).toBe(false);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint).not.toBeNull();
+  });
+
+  it("backfills a coverage gap on the bootstrap lane before the checkpoint seals it at EOF", async () => {
+    // The bootstrap lane runs at session start, BEFORE any afterTurn
+    // reconcile, and persists the checkpoint at EOF on any overlap. With a
+    // tail-anchored non-contiguous DB that sealed the never-imported middle
+    // behind an append-only checkpoint and the afterTurn coverage check never
+    // ran (the live failure shape: the unstuck conversation re-sealed itself
+    // on the very first turn).
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() } },
+    );
+    const sessionId = "bootstrap-coverage-gap";
+    const sessionKey = "agent:main:bootstrap-coverage-gap";
+    const transcript: Array<{ role: AgentMessage["role"]; content: string }> = Array.from(
+      { length: 130 },
+      (_, i) => ({
+        role: (i % 2 === 0 ? "user" : "assistant") as AgentMessage["role"],
+        content: `bootlane turn ${i}`,
+      }),
+    );
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({
+        role: "user",
+        content: "Conversation info (untrusted metadata): injected preamble",
+      }),
+    });
+    for (const tail of transcript.slice(-6, -4)) {
+      await engine.ingest({ sessionId, sessionKey, message: makeMessage(tail) });
+    }
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    await engine.getConversationStore().markConversationBootstrapped(conversation!.conversationId);
+    const sessionFile = createSessionFilePath("bootstrap-coverage-gap");
+    writeLeafTranscript(sessionFile, transcript);
+    const result = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(result.importedMessages).toBeGreaterThan(100);
+    const contents = (
+      await engine.getConversationStore().getMessages(conversation!.conversationId)
+    ).map((m) => m.content);
+    expect(contents).toContain("bootlane turn 0");
+    expect(contents).toContain("bootlane turn 129");
+    expect(contents.length).toBe(131);
+    expect(contents.filter((c) => c === "bootlane turn 124").length).toBe(1);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint).not.toBeNull();
+    const warns = warnLog.mock.calls.map((c) => String(c[0]));
+    expect(warns.some((m) => m.includes("coverage-gap backfill") && m.includes("lane: bootstrap"))).toBe(true);
+  });
+
   it("afterTurn recovers a checkpoint-missing conversation with a non-anchoring frontier instead of looping forever (#837)", async () => {
     // #837: a conversation with bootstrapped_at set but NO
     // conversation_bootstrap_state row classifies as reason="checkpoint-missing"

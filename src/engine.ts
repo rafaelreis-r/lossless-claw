@@ -2149,11 +2149,35 @@ export class LcmContextEngine implements ContextEngine {
             await this.conversationStore.markConversationBootstrapped(conversationId);
           }
 
-          if (reconcile.importedMessages > 0) {
+          // This lane runs at session start, BEFORE any afterTurn reconcile,
+          // and persists the bootstrap checkpoint at EOF on any overlap — so a
+          // tail-anchored result here can seal a never-imported middle behind
+          // an append-only checkpoint before the afterTurn coverage check ever
+          // sees the conversation. Backfill under the same lineage gates as the
+          // afterTurn lane (the helper's deficit check keeps covered
+          // conversations out).
+          let bootstrapCoverageGapImported = 0;
+          if (
+            reconcile.hasOverlap &&
+            conversation.sessionId === params.sessionId &&
+            conversation.bootstrappedAt !== null
+          ) {
+            bootstrapCoverageGapImported = await this.transcriptReconciler.backfillTranscriptCoverageGap({
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              conversationId,
+              historicalMessages,
+              lane: "bootstrap",
+            });
+          }
+
+          const bootstrapLaneImported =
+            reconcile.importedMessages + bootstrapCoverageGapImported;
+          if (bootstrapLaneImported > 0) {
             await persistBootstrapState(conversationId);
             return {
               bootstrapped: true,
-              importedMessages: reconcile.importedMessages,
+              importedMessages: bootstrapLaneImported,
               reason: "reconciled missing session messages",
             };
           }
